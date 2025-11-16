@@ -1,0 +1,20 @@
+[package]
+name = "concurrent-computation-graph"
+version = "0.1.0"
+edition = "2024"
+
+[lints.rust]
+rust_2018_idioms = { level = "warn", priority = -1 }
+unreachable_pub = "warn"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+[dependencies]
+derive_more = { version = "2", features = ["debug", "deref", "deref_mut"] }
+indexmap = "2"
+rayon = "1"
+rustc-hash = "2"
+thiserror = "2"

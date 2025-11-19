@@ -1,13 +1,21 @@
 [package]
-name = "concurrent-computation-graph"
+name = "ccg"
 version = "0.1.0"
 edition = "2024"
+authors = ["Andrew Sonin <sonin.cel@gmail.com>"]
+description = """A demo of a high-performance executor for Directed Acyclic Graphs (DAG) of tasks \
+with minimal synchronization overhead and a clear correctness story grounded in the C11 memory model."""
+categories = ["concurrency", "memory-management"]
+keywords = ["computation-graph", "DAG"]
+repository = "https://github.com/andrewsonin/ccg"
+homepage = "https://github.com/andrewsonin/ccg"
 
 [lints.rust]
 rust_2018_idioms = { level = "warn", priority = -1 }
 unreachable_pub = "warn"
 missing_docs = "warn"
 missing_debug_implementations = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
@@ -18,3 +26,8 @@ indexmap = "2"
 rayon = "1"
 rustc-hash = "2"
 thiserror = "2"
+unzip3 = "1"
+loom = { version = "0.7", optional = true }
+
+[features]
+loom = ["dep:loom"]

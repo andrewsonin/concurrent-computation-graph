@@ -16,9 +16,11 @@ use crate::{
     task::Task,
     types::{HashMap, HashSet, IndexMap, IndexSet, SyncUnsafeCell, TaskConfig, TaskId, TaskOutput},
 };
+use core::marker::PhantomData;
 use derive_more::Debug;
 use rustc_hash::FxBuildHasher;
 use std::collections::VecDeque;
+use unzip3::Unzip3;
 
 /// Concurrent DAG executor that builds a topological plan and runs tasks in
 /// parallel.
@@ -35,15 +37,16 @@ use std::collections::VecDeque;
 pub struct Executor<C: Config> {
     tasks: Vec<TaskSlot<C>>,
     outputs: Vec<OutputSlot<C>>,
+    parents: Vec<ParentInfoSlot>,
     num_independent_tasks: u16,
     task_id_to_index: HashMap<TaskId, u16>,
 }
 
-type TaskSlot<C> = SyncUnsafeCell<TaskLayout<C>>;
+pub(crate) type TaskSlot<C> = SyncUnsafeCell<TaskLayout<C>>;
 
 #[must_use]
 #[derive(Debug)]
-struct TaskLayout<C: Config> {
+pub(crate) struct TaskLayout<C: Config> {
     /// Current task.
     task: C::Task,
     /// Indexes of the downstream tasks that are dependent on the current task
@@ -54,13 +57,19 @@ struct TaskLayout<C: Config> {
     /// Indexes of the downstream tasks that are dependent on the current task
     /// but have multiple parents.
     shared_children: Vec<u16>,
+}
+
+#[must_use]
+#[derive(Debug)]
+#[repr(align(128))]
+pub(crate) struct ParentInfoSlot {
     /// Total number of parent tasks.
     parents_total: u16,
     /// Number of parent tasks that haven't finished yet.
     parents_left: AtomicU16,
 }
 
-type OutputSlot<C> = SyncUnsafeCell<Option<TaskOutput<C>>>;
+pub(crate) type OutputSlot<C> = SyncUnsafeCell<Option<TaskOutput<C>>>;
 
 struct TaskSetupLayout<'a> {
     task_idx: u16,
@@ -267,7 +276,7 @@ impl<C: Config> Executor<C> {
         // Phase 5: Materialize task and output slots in topological order.
         // Also classify edges into `owned_children` (child has exactly one parent)
         // and `shared_children` (child has multiple parents).
-        let (task_slots, output_slots) = task_info_map
+        let (task_slots, output_slots, parents) = task_info_map
             .iter()
             .enumerate()
             .map(|(idx, (task_id, task_info))| {
@@ -312,13 +321,15 @@ impl<C: Config> Executor<C> {
                     task: tasks.swap_remove(task_id).expect("Executor::new: [15]"),
                     owned_children,
                     shared_children,
-                    parents_total,
-                    parents_left: AtomicU16::new(parents_total),
                 });
                 let output_slot = OutputSlot::<C>::new(None);
-                (task_slot, output_slot)
+                let parents_info_slot = ParentInfoSlot {
+                    parents_total,
+                    parents_left: AtomicU16::new(parents_total),
+                };
+                (task_slot, output_slot, parents_info_slot)
             })
-            .unzip();
+            .unzip3();
 
         assert!(tasks.is_empty(), "Executor::new: [16]");
         drop(tasks);
@@ -328,6 +339,7 @@ impl<C: Config> Executor<C> {
         let result = Self {
             tasks: task_slots,
             outputs: output_slots,
+            parents,
             num_independent_tasks,
             task_id_to_index: task_info_map
                 .into_iter()
@@ -341,11 +353,16 @@ impl<C: Config> Executor<C> {
         );
         assert_eq!(
             result.tasks.len(),
-            result.task_id_to_index.len(),
+            result.parents.len(),
             "Executor::new: [18]"
         );
+        assert_eq!(
+            result.tasks.len(),
+            result.task_id_to_index.len(),
+            "Executor::new: [19]"
+        );
         if !result.tasks.is_empty() {
-            assert_ne!(result.num_independent_tasks, 0, "Executor::new: [19]");
+            assert_ne!(result.num_independent_tasks, 0, "Executor::new: [20]");
         }
         Ok(result)
     }
@@ -360,20 +377,76 @@ impl<C: Config> Executor<C> {
     ///
     /// This protocol ensures the child observes all parents' outputs while
     /// avoiding unnecessary barriers for purely owned edges.
+    #[cfg(not(feature = "loom"))]
     pub fn execute(&mut self) {
         let Self {
             tasks,
             outputs,
+            parents,
             num_independent_tasks,
             task_id_to_index,
         } = self;
         let exec_api = TaskExecApiImpl {
             outputs,
             task_id_to_index,
+            _marker: PhantomData,
         };
         let independent_task_range = 0..*num_independent_tasks as usize;
+        // SAFETY: Slices and the range are derived from `self` and satisfy the
+        // preconditions of `join_independent_tasks`: indices are in-bounds and refer
+        // only to independent tasks.
         unsafe {
-            join_independent_tasks(tasks, outputs, independent_task_range, exec_api);
+            join_independent_tasks(tasks, outputs, parents, independent_task_range, exec_api);
+        }
+    }
+
+    /// Loom-testable version of `execute`.
+    #[cfg(feature = "loom")]
+    pub fn execute(self) -> Self {
+        use std::sync::Arc;
+
+        let Self {
+            tasks,
+            outputs,
+            parents,
+            num_independent_tasks,
+            task_id_to_index,
+        } = self;
+
+        let tasks = Arc::new(tasks);
+        let outputs = Arc::new(outputs);
+        let parents = Arc::new(parents);
+        let task_id_to_index = Arc::new(task_id_to_index);
+
+        let exec_api = TaskExecApiImpl {
+            outputs: outputs.clone(),
+            task_id_to_index: task_id_to_index.clone(),
+            _marker: PhantomData,
+        };
+        let independent_task_range = 0..num_independent_tasks as usize;
+        // SAFETY: The `Arc`-backed slices and index range satisfy the preconditions of
+        // `join_independent_tasks`; roots are in-bounds and independent.
+        unsafe {
+            join_independent_tasks(
+                tasks.clone(),
+                exec_api.outputs.clone(),
+                parents.clone(),
+                independent_task_range,
+                exec_api,
+            );
+        }
+
+        let tasks = Arc::into_inner(tasks).unwrap();
+        let outputs = Arc::into_inner(outputs).unwrap();
+        let parents = Arc::into_inner(parents).unwrap();
+        let task_id_to_index = Arc::into_inner(task_id_to_index).unwrap();
+
+        Self {
+            tasks,
+            outputs,
+            parents,
+            num_independent_tasks,
+            task_id_to_index,
         }
     }
 }

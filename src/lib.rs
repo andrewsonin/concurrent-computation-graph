@@ -1,3 +1,4 @@
+#![allow(clippy::wildcard_imports)]
 //! Concurrent computation graph executor with minimal synchronization overhead.
 //!
 //! This crate provides a high-performance executor for Directed Acyclic Graphs
